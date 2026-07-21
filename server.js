@@ -1,29 +1,65 @@
 /**
  * סוכן AI לקו תוכן בימות המשיח
  * =================================
- * משתמש בספריית yemot-router2 (https://github.com/ShlomoCode/yemot-router2)
- * שמטפלת נכון בכל הפרוטוקול הגולמי של ימות.
+ * גרסה שמשתמשת בהקלטה רגילה (חינמית) + תמלול עם Whisper של OpenAI,
+ * במקום זיהוי הדיבור המובנה של ימות (שדורש יחידות בתשלום).
  *
  * תהליך לכל שאלה:
- * 1. call.read(..., 'stt') - ימות מקליט ומתמלל בעצמו לעברית (זיהוי דיבור מובנה)
- * 2. שולחים את הטקסט למודל שפה עם חיפוש אינטרנט -> מקבלים תשובה קצרה
- * 3. call.id_list_message(...) - ימות מקריא את התשובה בעצמו (TTS מובנה)
- * 4. חוזרים לשלב 1 (לולאה) עד שהמאזין מנתק
+ * 1. call.read(..., 'record') - ימות מקליט את השאלה ומחזיר נתיב לקובץ
+ * 2. מורידים את הקובץ מימות (DownloadFile API) ומתמללים עם Whisper
+ * 3. שולחים את הטקסט למודל שפה עם חיפוש אינטרנט -> מקבלים תשובה קצרה
+ * 4. call.id_list_message(...) - ימות מקריא את התשובה בעצמו (TTS מובנה, חינמי)
+ * 5. חוזרים לשלב 1 (לולאה) עד שהמאזין מנתק
  */
 
 import express from 'express';
 import { YemotRouter } from 'yemot-router2';
 import OpenAI from 'openai';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { toFile } from 'openai/uploads';
 
 const app = express();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const YEMOT_TOKEN = process.env.YEMOT_TOKEN; // לדוגמה "0779709932:7292"
+const YEMOT_API_BASE = 'https://www.call2all.co.il/ym/api';
+
 const router = YemotRouter({
-    printLog: true, // לוגים מפורטים - שימושי מאוד בפיתוח, אפשר לכבות בהמשך
+    printLog: true, // חשוב! כך נראה בלוגים את הנתיב המדויק שחוזר מההקלטה
 });
 
 // -----------------------------------------------------------------------
-// הפונקציה שמחפשת ועונה - כאן אפשר להחליף בכל ספק חיפוש/מודל שנרצה בהמשך
+// הורדת קובץ ההקלטה מימות ותמלול עם Whisper
+// -----------------------------------------------------------------------
+async function downloadAndTranscribe(recordingPath) {
+    // נתיב שחוזר מ-call.read במצב 'record' - לרוב יחסי לשלוחה.
+    // אם הוא לא כולל כבר את התחילית ivr2:, נוסיף אותה.
+    const fullPath = recordingPath.startsWith('ivr2:') ? recordingPath : `ivr2:${recordingPath}`;
+
+    const url = `${YEMOT_API_BASE}/DownloadFile?token=${encodeURIComponent(YEMOT_TOKEN)}&path=${encodeURIComponent(fullPath)}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+        throw new Error(`Yemot DownloadFile failed: ${resp.status}`);
+    }
+    const buffer = Buffer.from(await resp.arrayBuffer());
+
+    const tmpFile = path.join(os.tmpdir(), `rec-${Date.now()}.wav`);
+    fs.writeFileSync(tmpFile, buffer);
+
+    const transcription = await openai.audio.transcriptions.create({
+        model: 'whisper-1',
+        file: await toFile(fs.createReadStream(tmpFile), 'audio.wav'),
+        language: 'he',
+    });
+
+    fs.unlinkSync(tmpFile);
+    return transcription.text.trim();
+}
+
+// -----------------------------------------------------------------------
+// חיפוש באינטרנט + ניסוח תשובה קצרה בעברית
 // -----------------------------------------------------------------------
 async function searchAndAnswer(question) {
     const response = await openai.responses.create({
@@ -42,27 +78,27 @@ async function searchAndAnswer(question) {
 // הלוגיקה הראשית של השיחה
 // -----------------------------------------------------------------------
 router.get('/', async (call) => {
-    // עד 10 שאלות ברצף בשיחה אחת (הגנה מפני לולאה אינסופית)
     for (let i = 0; i < 10; i++) {
-        const question = await call.read(
-            [{ type: 'text', data: i === 0 ? 'שלום, מה תרצה לשאול' : 'תרצה לשאול עוד משהו, או לנתק' }],
-            'stt',
-            { lang: 'he-IL' }
+        const recordingPath = await call.read(
+            [{ type: 'text', data: i === 0 ? 'שלום, אחרי הצפצוף אמור את שאלתך' : 'תרצה לשאול עוד משהו' }],
+            'record',
+            { no_confirm_menu: true, max_length: 30 }
         );
 
-        if (!question || question.trim() === '') {
+        if (!recordingPath) {
             return call.id_list_message([{ type: 'text', data: 'תודה, להתראות' }]);
         }
 
-        let answer;
+        let question, answer;
         try {
-            answer = await searchAndAnswer(question);
+            question = await downloadAndTranscribe(recordingPath);
+            console.log('Transcribed:', question);
+            answer = question ? await searchAndAnswer(question) : 'לא הצלחתי להבין את השאלה, נסו שוב';
         } catch (err) {
-            console.error('AI error:', err);
+            console.error('Processing error:', err);
             answer = 'מצטער, קרתה שגיאה בעיבוד השאלה, נסו לשאול שוב';
         }
 
-        // משמיעים את התשובה, ואז (prependToNextAction) ממשיכים ישר ללולאה הבאה
         await call.id_list_message([{ type: 'text', data: answer, removeInvalidChars: true }], {
             prependToNextAction: true,
         });
