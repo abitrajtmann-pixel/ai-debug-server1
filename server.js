@@ -1,45 +1,28 @@
 /**
  * סוכן AI לקו תוכן בימות המשיח
  * =================================
- * גרסה עם Gemini API + רוטציה בין כמה מפתחות (GEMINI_API_KEY, GEMINI_API_KEY1..4)
- * כדי לנצל את מלוא המכסה החינמית הזמינה בין החשבונות.
+ * גרסה עם Groq (תמלול + מודל שפה, חינמי, מכסה נדיבה) + Tavily (חיפוש אינטרנט, חינמי).
  *
  * תהליך לכל שאלה:
  * 1. call.read(..., 'record') - ימות מקליט את השאלה ומחזיר נתיב לקובץ (חינמי)
  * 2. מורידים את הקובץ מימות (DownloadFile API)
- * 3. שולחים את קובץ השמע ישירות ל-Gemini עם כלי חיפוש - מקבלים תשובה מוכנה
- *    אם מפתח מסוים חרג ממכסה (429), עוברים אוטומטית למפתח הבא ברשימה
- * 4. call.id_list_message(...) - ימות מקריא את התשובה בעצמו (TTS מובנה, חינמי)
- * 5. חוזרים לשלב 1 (לולאה) עד שהמאזין מנתק
+ * 3. מתמללים עם Groq Whisper
+ * 4. מחפשים באינטרנט עם Tavily
+ * 5. שולחים את השאלה + תוצאות החיפוש למודל שפה של Groq -> תשובה קצרה בעברית
+ * 6. call.id_list_message(...) - ימות מקריא את התשובה בעצמו (TTS מובנה, חינמי)
+ * 7. חוזרים לשלב 1 (לולאה) עד שהמאזין מנתק
  */
 
 import express from 'express';
 import { YemotRouter } from 'yemot-router2';
-import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
 const app = express();
 
-// -----------------------------------------------------------------------
-// איסוף כל מפתחות ה-Gemini הזמינים ממשתני הסביבה
-// -----------------------------------------------------------------------
-const API_KEYS = [
-    process.env.GEMINI_API_KEY,
-    process.env.GEMINI_API_KEY1,
-    process.env.GEMINI_API_KEY2,
-    process.env.GEMINI_API_KEY3,
-    process.env.GEMINI_API_KEY4,
-].filter(Boolean); // מסנן ערכים ריקים אם חסר מפתח כלשהו
-
-if (API_KEYS.length === 0) {
-    console.error('No GEMINI_API_KEY* environment variables found!');
-}
-
-// אינדקס "המפתח הבא לנסות" - נשמר בזיכרון בין שיחות, כדי לפזר עומס
-let nextKeyIndex = 0;
-
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN; // לדוגמה "0779709932:7292"
 const YEMOT_API_BASE = 'https://www.call2all.co.il/ym/api';
 
@@ -64,52 +47,90 @@ async function downloadRecording(recordingPath) {
 }
 
 // -----------------------------------------------------------------------
-// שליחת קובץ השמע ל-Gemini, עם רוטציה אוטומטית בין מפתחות במקרה של 429
+// תמלול עם Groq Whisper
 // -----------------------------------------------------------------------
-async function transcribeAndAnswer(audioFilePath) {
-    const audioBytes = fs.readFileSync(audioFilePath);
+async function transcribeWithGroq(audioFilePath) {
+    const form = new FormData();
+    form.append('file', new Blob([fs.readFileSync(audioFilePath)]), 'audio.wav');
+    form.append('model', 'whisper-large-v3');
+    form.append('language', 'he');
 
-    const promptParts = [
-        { inlineData: { mimeType: 'audio/wav', data: audioBytes.toString('base64') } },
-        {
-            text:
-                'הקובץ המצורף הוא הקלטה קולית של שאלה בעברית. תמלל אותה, ' +
-                'ואז ענה על השאלה בעברית בלבד, בקצרה וברור ' +
-                '(2-4 משפטים לכל היותר, מתאים להקראה בטלפון, ' +
-                'בלי סימני פיסוק מיוחדים כמו מקף או גרש). ' +
-                'אם צריך מידע עדכני, חפש באינטרנט. ' +
-                'החזר רק את התשובה עצמה, בלי לחזור על התמלול או להסביר מה עשית.',
-        },
-    ];
+    const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: form,
+    });
 
-    let lastError;
-
-    // מנסים את כל המפתחות בתור, מתחילים מהמקום שהפסקנו בו בפעם הקודמת
-    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
-        const keyIndex = (nextKeyIndex + attempt) % API_KEYS.length;
-        const apiKey = API_KEYS[keyIndex];
-        const genAI = new GoogleGenAI({ apiKey });
-
-        try {
-            const response = await genAI.models.generateContent({
-                model: 'gemini-3.5-flash-lite',
-                contents: [{ role: 'user', parts: promptParts }],
-                config: { tools: [{ googleSearch: {} }] },
-            });
-
-            // הצלחה - נתחיל מהמפתח הבא בפעם הבאה, כדי לפזר עומס
-            nextKeyIndex = (keyIndex + 1) % API_KEYS.length;
-            return response.text.trim();
-        } catch (err) {
-            const is429 = err?.message?.includes('429') || err?.message?.includes('RESOURCE_EXHAUSTED');
-            console.error(`Key #${keyIndex} failed${is429 ? ' (quota exceeded)' : ''}:`, err.message);
-            lastError = err;
-            if (!is429) throw err; // שגיאה שאינה מכסה - אין טעם לנסות מפתחות נוספים
-            // אחרת - ממשיכים ללולאה ומנסים את המפתח הבא
-        }
+    if (!resp.ok) {
+        throw new Error(`Groq transcription failed: ${resp.status} ${await resp.text()}`);
     }
+    const data = await resp.json();
+    return data.text.trim();
+}
 
-    throw lastError ?? new Error('No API keys configured');
+// -----------------------------------------------------------------------
+// חיפוש באינטרנט עם Tavily
+// -----------------------------------------------------------------------
+async function searchTavily(query) {
+    const resp = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            api_key: TAVILY_API_KEY,
+            query,
+            search_depth: 'basic',
+            max_results: 4,
+            include_answer: true,
+        }),
+    });
+
+    if (!resp.ok) {
+        throw new Error(`Tavily search failed: ${resp.status} ${await resp.text()}`);
+    }
+    const data = await resp.json();
+
+    // תקציר קצר של תוצאות החיפוש, כדי להזין למודל השפה
+    const snippets = (data.results || [])
+        .slice(0, 4)
+        .map((r) => `- ${r.title}: ${r.content}`.slice(0, 300))
+        .join('\n');
+
+    return { quickAnswer: data.answer || '', snippets };
+}
+
+// -----------------------------------------------------------------------
+// ניסוח תשובה קצרה בעברית עם מודל השפה של Groq, על בסיס תוצאות החיפוש
+// -----------------------------------------------------------------------
+async function answerWithGroq(question, searchContext) {
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+                {
+                    role: 'system',
+                    content:
+                        'אתה עונה בעברית בלבד, בקצרה וברור (2-4 משפטים לכל היותר), ' +
+                        'בצורה שמתאימה להקראה בטלפון (בלי סימני פיסוק מיוחדים כמו מקף או גרש). ' +
+                        'התבסס על תוצאות החיפוש שסופקו אם הן רלוונטיות.',
+                },
+                {
+                    role: 'user',
+                    content: `שאלה: ${question}\n\nתוצאות חיפוש:\n${searchContext.quickAnswer}\n${searchContext.snippets}`,
+                },
+            ],
+        }),
+    });
+
+    if (!resp.ok) {
+        throw new Error(`Groq chat failed: ${resp.status} ${await resp.text()}`);
+    }
+    const data = await resp.json();
+    return data.choices[0].message.content.trim();
 }
 
 // -----------------------------------------------------------------------
@@ -131,7 +152,11 @@ router.get('/', async (call) => {
         let tmpFile;
         try {
             tmpFile = await downloadRecording(recordingPath);
-            answer = await transcribeAndAnswer(tmpFile);
+            const question = await transcribeWithGroq(tmpFile);
+            console.log('Transcribed:', question);
+
+            const searchContext = await searchTavily(question);
+            answer = await answerWithGroq(question, searchContext);
             console.log('Answer:', answer);
         } catch (err) {
             console.error('Processing error:', err);
@@ -151,4 +176,4 @@ router.get('/', async (call) => {
 app.use(router.asExpressRouter ?? router);
 
 const port = process.env.PORT || 5000;
-app.listen(port, () => console.log(`Server listening on port ${port}, ${API_KEYS.length} Gemini keys loaded`));
+app.listen(port, () => console.log(`Server listening on port ${port}`));
