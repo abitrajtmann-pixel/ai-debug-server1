@@ -1,27 +1,27 @@
 /**
  * סוכן AI לקו תוכן בימות המשיח
  * =================================
- * גרסה שמשתמשת בהקלטה רגילה (חינמית) + תמלול עם Whisper של OpenAI,
- * במקום זיהוי הדיבור המובנה של ימות (שדורש יחידות בתשלום).
+ * גרסה עם Gemini API (Google AI Studio) - חינמי לגמרי, ללא כרטיס אשראי.
+ * Gemini מקבל את קובץ ההקלטה ישירות (הוא מולטימודלי), מתמלל, מחפש
+ * באינטרנט (Google Search grounding), ועונה - הכול בקריאה אחת.
  *
  * תהליך לכל שאלה:
- * 1. call.read(..., 'record') - ימות מקליט את השאלה ומחזיר נתיב לקובץ
- * 2. מורידים את הקובץ מימות (DownloadFile API) ומתמללים עם Whisper
- * 3. שולחים את הטקסט למודל שפה עם חיפוש אינטרנט -> מקבלים תשובה קצרה
+ * 1. call.read(..., 'record') - ימות מקליט את השאלה ומחזיר נתיב לקובץ (חינמי)
+ * 2. מורידים את הקובץ מימות (DownloadFile API)
+ * 3. שולחים את קובץ השמע ישירות ל-Gemini עם כלי חיפוש - מקבלים תשובה מוכנה
  * 4. call.id_list_message(...) - ימות מקריא את התשובה בעצמו (TTS מובנה, חינמי)
  * 5. חוזרים לשלב 1 (לולאה) עד שהמאזין מנתק
  */
 
 import express from 'express';
 import { YemotRouter } from 'yemot-router2';
-import OpenAI from 'openai';
+import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { toFile } from 'openai/uploads';
 
 const app = express();
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN; // לדוגמה "0779709932:7292"
 const YEMOT_API_BASE = 'https://www.call2all.co.il/ym/api';
@@ -31,47 +31,52 @@ const router = YemotRouter({
 });
 
 // -----------------------------------------------------------------------
-// הורדת קובץ ההקלטה מימות ותמלול עם Whisper
+// הורדת קובץ ההקלטה מימות
 // -----------------------------------------------------------------------
-async function downloadAndTranscribe(recordingPath) {
-    // נתיב שחוזר מ-call.read במצב 'record' - לרוב יחסי לשלוחה.
-    // אם הוא לא כולל כבר את התחילית ivr2:, נוסיף אותה.
+async function downloadRecording(recordingPath) {
     const fullPath = recordingPath.startsWith('ivr2:') ? recordingPath : `ivr2:${recordingPath}`;
-
     const url = `${YEMOT_API_BASE}/DownloadFile?token=${encodeURIComponent(YEMOT_TOKEN)}&path=${encodeURIComponent(fullPath)}`;
     const resp = await fetch(url);
     if (!resp.ok) {
         throw new Error(`Yemot DownloadFile failed: ${resp.status}`);
     }
     const buffer = Buffer.from(await resp.arrayBuffer());
-
     const tmpFile = path.join(os.tmpdir(), `rec-${Date.now()}.wav`);
     fs.writeFileSync(tmpFile, buffer);
-
-    const transcription = await openai.audio.transcriptions.create({
-        model: 'whisper-1',
-        file: await toFile(fs.createReadStream(tmpFile), 'audio.wav'),
-        language: 'he',
-    });
-
-    fs.unlinkSync(tmpFile);
-    return transcription.text.trim();
+    return tmpFile;
 }
 
 // -----------------------------------------------------------------------
-// חיפוש באינטרנט + ניסוח תשובה קצרה בעברית
+// שליחת קובץ השמע ל-Gemini: תמלול + חיפוש + תשובה, בקריאה אחת
 // -----------------------------------------------------------------------
-async function searchAndAnswer(question) {
-    const response = await openai.responses.create({
-        model: 'gpt-4.1',
-        tools: [{ type: 'web_search' }],
-        input:
-            'ענה בעברית בלבד, בקצרה וברור (2-4 משפטים לכל היותר, ' +
-            'מתאים להקראה בטלפון, בלי סימני פיסוק מיוחדים כמו מקף או גרש). ' +
-            'אם צריך מידע עדכני, חפש באינטרנט. ' +
-            `שאלה: ${question}`,
+async function transcribeAndAnswer(audioFilePath) {
+    const audioBytes = fs.readFileSync(audioFilePath);
+
+    const response = await genAI.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+            {
+                role: 'user',
+                parts: [
+                    { inlineData: { mimeType: 'audio/wav', data: audioBytes.toString('base64') } },
+                    {
+                        text:
+                            'הקובץ המצורף הוא הקלטה קולית של שאלה בעברית. תמלל אותה, ' +
+                            'ואז ענה על השאלה בעברית בלבד, בקצרה וברור ' +
+                            '(2-4 משפטים לכל היותר, מתאים להקראה בטלפון, ' +
+                            'בלי סימני פיסוק מיוחדים כמו מקף או גרש). ' +
+                            'אם צריך מידע עדכני, חפש באינטרנט. ' +
+                            'החזר רק את התשובה עצמה, בלי לחזור על התמלול או להסביר מה עשית.',
+                    },
+                ],
+            },
+        ],
+        config: {
+            tools: [{ googleSearch: {} }],
+        },
     });
-    return response.output_text.trim();
+
+    return response.text.trim();
 }
 
 // -----------------------------------------------------------------------
@@ -89,14 +94,17 @@ router.get('/', async (call) => {
             return call.id_list_message([{ type: 'text', data: 'תודה, להתראות' }]);
         }
 
-        let question, answer;
+        let answer;
+        let tmpFile;
         try {
-            question = await downloadAndTranscribe(recordingPath);
-            console.log('Transcribed:', question);
-            answer = question ? await searchAndAnswer(question) : 'לא הצלחתי להבין את השאלה, נסו שוב';
+            tmpFile = await downloadRecording(recordingPath);
+            answer = await transcribeAndAnswer(tmpFile);
+            console.log('Answer:', answer);
         } catch (err) {
             console.error('Processing error:', err);
             answer = 'מצטער, קרתה שגיאה בעיבוד השאלה, נסו לשאול שוב';
+        } finally {
+            if (tmpFile && fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
         }
 
         await call.id_list_message([{ type: 'text', data: answer, removeInvalidChars: true }], {
